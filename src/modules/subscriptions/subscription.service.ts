@@ -1,8 +1,12 @@
-﻿import { UUID } from "mongodb";
+import { randomUUID } from "node:crypto";
+import { UUID } from "mongodb";
 
 import { client } from "../../config/db.js";
 import { env } from "../../config/env.js";
 import { getStripeClient } from "../../config/stripe.js";
+
+type StripeSubscription = import("stripe").default.Subscription;
+type StripeEvent = import("stripe").default.Event;
 
 interface VendorDocument {
   _id: UUID;
@@ -12,6 +16,9 @@ interface VendorDocument {
   isBlocked: boolean;
   subscriptionPlan?: "free" | "premium";
   subscriptionExpiresAt?: Date | null;
+  stripeSubscriptionId?: string;
+  checkoutLockId?: string;
+  checkoutLockUntil?: Date;
 }
 
 interface TransactionDocument {
@@ -41,6 +48,16 @@ const getUsersCollection = () =>
 const getTransactionsCollection = () =>
   client.db(env.DB_NAME).collection<TransactionDocument>("transactions");
 
+const CHECKOUT_LOCK_DURATION_MS = 5 * 60 * 1000;
+
+const parseVendorId = (vendorId: string): UUID => {
+  try {
+    return new UUID(vendorId);
+  } catch {
+    throw new Error("Invalid vendor ID in Stripe metadata.");
+  }
+};
+
 export const ensureSubscriptionIndexes = async (): Promise<void> => {
   const transactions = getTransactionsCollection();
 
@@ -52,6 +69,16 @@ export const ensureSubscriptionIndexes = async (): Promise<void> => {
   await transactions.createIndex(
     { vendorId: 1, createdAt: -1 },
     { name: "vendor_transactions" }
+  );
+
+  await transactions.createIndex(
+    { stripeSubscriptionId: 1 },
+    {
+      name: "stripe_subscription_lookup",
+      partialFilterExpression: {
+        stripeSubscriptionId: { $exists: true },
+      },
+    }
   );
 };
 
@@ -70,15 +97,24 @@ export const createPremiumCheckoutSession = async (
   try {
     vendorObjectId = new UUID(vendorId);
   } catch {
-    throw new SubscriptionServiceError("Invalid vendor account.", 400);
+    throw new SubscriptionServiceError(
+      "Invalid vendor account.",
+      400
+    );
   }
 
-  const vendor = await getUsersCollection().findOne({
+  const users = getUsersCollection();
+  const transactions = getTransactionsCollection();
+
+  const vendor = await users.findOne({
     _id: vendorObjectId,
   });
 
   if (!vendor) {
-    throw new SubscriptionServiceError("Vendor account not found.", 404);
+    throw new SubscriptionServiceError(
+      "Vendor account not found.",
+      404
+    );
   }
 
   if (vendor.role !== "vendor") {
@@ -95,169 +131,419 @@ export const createPremiumCheckoutSession = async (
     );
   }
 
-  const hasActivePremium =
-    vendor.subscriptionPlan === "premium" &&
-    vendor.subscriptionExpiresAt instanceof Date &&
-    vendor.subscriptionExpiresAt.getTime() > Date.now();
+  const lockId = randomUUID();
+  const now = new Date();
 
-  if (hasActivePremium) {
+  const lockResult = await users.updateOne(
+    {
+      _id: vendorObjectId,
+      role: "vendor",
+      isBlocked: { $ne: true },
+      $or: [
+        { checkoutLockUntil: { $exists: false } },
+        { checkoutLockUntil: { $lte: now } },
+        { checkoutLockUntil: { $type: "null" } },
+      ],
+    },
+    {
+      $set: {
+        checkoutLockId: lockId,
+        checkoutLockUntil: new Date(
+          now.getTime() + CHECKOUT_LOCK_DURATION_MS
+        ),
+      },
+    }
+  );
+
+  if (lockResult.matchedCount !== 1) {
     throw new SubscriptionServiceError(
-      "Your Premium subscription is already active.",
+      "Another checkout request is already being processed. Please try again shortly.",
       409
     );
   }
 
-  const stripe = getStripeClient();
+  try {
+    const currentVendor = await users.findOne({
+      _id: vendorObjectId,
+      role: "vendor",
+    });
 
-  const price = await stripe.prices.retrieve(env.STRIPE_PRICE_ID);
+    if (!currentVendor) {
+      throw new SubscriptionServiceError(
+        "Vendor account not found.",
+        404
+      );
+    }
 
-  if (!price.active || !price.recurring || price.unit_amount === null) {
-    throw new SubscriptionServiceError(
-      "The configured Stripe Price must be an active recurring price.",
-      400
-    );
-  }
+    if (currentVendor.isBlocked) {
+      throw new SubscriptionServiceError(
+        "Blocked vendors cannot purchase subscriptions.",
+        403
+      );
+    }
 
-  const session = await stripe.checkout.sessions.create({
-    mode: "subscription",
-    customer_email: vendor.email,
-    client_reference_id: vendorId,
-    line_items: [
+    const hasActivePremium =
+      currentVendor.subscriptionPlan === "premium" &&
+      currentVendor.subscriptionExpiresAt instanceof Date &&
+      currentVendor.subscriptionExpiresAt.getTime() > Date.now();
+
+    if (hasActivePremium) {
+      throw new SubscriptionServiceError(
+        "Your Premium subscription is already active.",
+        409
+      );
+    }
+
+    const stripe = getStripeClient();
+
+    const pendingTransaction = await transactions.findOne(
       {
-        price: env.STRIPE_PRICE_ID,
-        quantity: 1,
+        vendorId: vendorObjectId,
+        plan: "premium",
+        status: "pending",
       },
-    ],
-    metadata: {
-      vendorId,
-      plan: "premium",
-    },
-    subscription_data: {
+      {
+        sort: { createdAt: -1 },
+      }
+    );
+
+    if (pendingTransaction) {
+      const existingSession =
+        await stripe.checkout.sessions.retrieve(
+          pendingTransaction.stripeSessionId
+        );
+
+      if (
+        existingSession.status === "open" &&
+        existingSession.url
+      ) {
+        return {
+          url: existingSession.url,
+          sessionId: existingSession.id,
+        };
+      }
+
+      if (existingSession.status === "expired") {
+        await transactions.updateOne(
+          {
+            stripeSessionId: existingSession.id,
+            status: "pending",
+          },
+          {
+            $set: {
+              status: "cancelled",
+            },
+          }
+        );
+      } else {
+        throw new SubscriptionServiceError(
+          "Your previous checkout is being processed. Please wait before trying again.",
+          409
+        );
+      }
+    }
+
+    const price = await stripe.prices.retrieve(
+      env.STRIPE_PRICE_ID
+    );
+
+    if (
+      !price.active ||
+      !price.recurring ||
+      price.unit_amount === null
+    ) {
+      throw new SubscriptionServiceError(
+        "The configured Stripe Price must be an active recurring price.",
+        400
+      );
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      customer_email: currentVendor.email,
+      client_reference_id: vendorId,
+
+      line_items: [
+        {
+          price: env.STRIPE_PRICE_ID,
+          quantity: 1,
+        },
+      ],
+
       metadata: {
         vendorId,
         plan: "premium",
       },
-    },
-    success_url: `${env.CLIENT_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
-    cancel_url: `${env.CLIENT_URL}/payment/cancel`,
+
+      subscription_data: {
+        metadata: {
+          vendorId,
+          plan: "premium",
+        },
+      },
+
+      success_url: `${env.CLIENT_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${env.CLIENT_URL}/payment/cancel`,
+    });
+
+    if (!session.url) {
+      try {
+        await stripe.checkout.sessions.expire(session.id);
+      } catch {
+        // Preserve the original error.
+      }
+
+      throw new SubscriptionServiceError(
+        "Unable to create the Stripe Checkout URL.",
+        500
+      );
+    }
+
+    try {
+      await transactions.insertOne({
+        vendorId: vendorObjectId,
+        plan: "premium",
+        amount: price.unit_amount,
+        currency: price.currency,
+        stripeSessionId: session.id,
+        status: "pending",
+        createdAt: new Date(),
+      });
+    } catch (error) {
+      try {
+        await stripe.checkout.sessions.expire(session.id);
+      } catch {
+        // Preserve the original database error.
+      }
+
+      throw error;
+    }
+
+    return {
+      url: session.url,
+      sessionId: session.id,
+    };
+  } finally {
+    try {
+      await users.updateOne(
+        {
+          _id: vendorObjectId,
+          checkoutLockId: lockId,
+        },
+        {
+          $unset: {
+            checkoutLockId: "",
+            checkoutLockUntil: "",
+          },
+        }
+      );
+    } catch {
+      // The lock expires automatically as a fallback.
+    }
+  }
+};
+
+const handleCheckoutCompleted = async (
+  event: StripeEvent
+): Promise<void> => {
+  const stripe = getStripeClient();
+  const session = event.data.object as import("stripe").default.Checkout.Session;
+
+  if (session.mode !== "subscription" || !session.subscription) {
+    return;
+  }
+
+  const vendorId = session.metadata?.vendorId;
+
+  if (
+    !vendorId ||
+    session.client_reference_id !== vendorId ||
+    session.metadata?.plan !== "premium"
+  ) {
+    throw new Error("Invalid vendor metadata in Stripe Checkout Session.");
+  }
+
+  const vendorObjectId = parseVendorId(vendorId);
+
+  const transactions = getTransactionsCollection();
+
+  const existingTransaction = await transactions.findOne({
+    stripeSessionId: session.id,
+    vendorId: vendorObjectId,
+    plan: "premium",
+    status: { $in: ["pending", "paid"] },
   });
 
-  if (!session.url) {
-    throw new SubscriptionServiceError(
-      "Unable to create the Stripe Checkout URL.",
-      500
+  if (!existingTransaction) {
+    throw new Error("Verified subscription transaction was not found.");
+  }
+
+  if (
+    session.payment_status !== "paid" &&
+    session.payment_status !== "no_payment_required"
+  ) {
+    return;
+  }
+
+  const subscriptionId =
+    typeof session.subscription === "string"
+      ? session.subscription
+      : session.subscription.id;
+
+  const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+
+  if (
+    subscription.metadata?.vendorId !== vendorId ||
+    subscription.metadata?.plan !== "premium"
+  ) {
+    throw new Error("Stripe subscription metadata does not match the vendor.");
+  }
+
+  if (!["active", "trialing"].includes(subscription.status)) {
+    return;
+  }
+
+  const currentPeriodEnd =
+    subscription.items.data[0]?.current_period_end;
+
+  if (!currentPeriodEnd) {
+    throw new Error("Stripe subscription period end is unavailable.");
+  }
+
+  const transactionResult = await transactions.updateOne(
+    {
+      stripeSessionId: session.id,
+      vendorId: vendorObjectId,
+      status: { $in: ["pending", "paid"] },
+    },
+    {
+      $set: {
+        status: "paid",
+        stripeSubscriptionId: subscriptionId,
+      },
+    }
+  );
+
+  if (transactionResult.matchedCount !== 1) {
+    throw new Error("Subscription transaction could not be verified.");
+  }
+
+  // Do not let an older checkout overwrite a different current subscription.
+  // A missing or expired previous subscription can be replaced.
+  await getUsersCollection().updateOne(
+    {
+      _id: vendorObjectId,
+      role: "vendor",
+      isBlocked: false,
+      $or: [
+        { stripeSubscriptionId: { $exists: false } },
+        { stripeSubscriptionId: subscriptionId },
+        {
+          subscriptionExpiresAt: {
+            $lte: new Date(),
+          },
+        },
+        {
+          subscriptionExpiresAt: {
+            $type: "null",
+          },
+        },
+        {
+          subscriptionExpiresAt: {
+            $exists: false,
+          },
+        },
+      ],
+    },
+    {
+      $set: {
+        subscriptionPlan: "premium",
+        subscriptionExpiresAt: new Date(currentPeriodEnd * 1000),
+        stripeSubscriptionId: subscriptionId,
+      },
+    }
+  );
+
+  // A blocked or missing vendor is not activated.
+  // The verified payment transaction is still retained.
+};
+
+const handleSubscriptionLifecycle = async (
+  event: StripeEvent
+): Promise<void> => {
+  const eventSubscription =
+    event.data.object as StripeSubscription;
+
+  const vendorId = eventSubscription.metadata?.vendorId;
+
+  if (
+    !vendorId ||
+    eventSubscription.metadata?.plan !== "premium"
+  ) {
+    throw new Error("Vendor ID or plan is missing from subscription metadata.");
+  }
+
+  const vendorObjectId = parseVendorId(vendorId);
+  const subscriptionId = eventSubscription.id;
+
+  const transactions = getTransactionsCollection();
+
+  // A lifecycle event must belong to a verified, paid transaction.
+  // If checkout.session.completed has not arrived yet, throw so Stripe retries.
+  const transaction = await transactions.findOne({
+    vendorId: vendorObjectId,
+    plan: "premium",
+    stripeSubscriptionId: subscriptionId,
+    status: "paid",
+  });
+
+  if (!transaction) {
+    throw new Error(
+      "A paid transaction for this Stripe subscription was not found."
     );
   }
 
+  let latestSubscription: StripeSubscription;
+
   try {
-    await getTransactionsCollection().insertOne({
-      vendorId: vendorObjectId,
-      plan: "premium",
-      amount: price.unit_amount,
-      currency: price.currency,
-      stripeSessionId: session.id,
-      status: "pending",
-      createdAt: new Date(),
-    });
+    latestSubscription = await getStripeClient().subscriptions.retrieve(
+      subscriptionId
+    );
   } catch (error) {
-    // Avoid leaving an unused Checkout Session open.
-    try {
-      await stripe.checkout.sessions.expire(session.id);
-    } catch {
-      // Preserve the original database error.
+    // Stripe may no longer return a deleted subscription.
+    // In that case, the signed deletion event is the source of truth.
+    if (event.type !== "customer.subscription.deleted") {
+      throw error;
     }
 
-    throw error;
+    latestSubscription = eventSubscription;
   }
 
-  return {
-    url: session.url,
-    sessionId: session.id,
-  };
-};
+  if (
+    latestSubscription.metadata?.vendorId !== vendorId ||
+    latestSubscription.metadata?.plan !== "premium"
+  ) {
+    throw new Error("Retrieved Stripe subscription metadata does not match.");
+  }
 
-export const handleSubscriptionWebhook = async (
-  event: import("stripe").default.Event
-): Promise<void> => {
-  const stripe = getStripeClient();
+  const isActive =
+    event.type !== "customer.subscription.deleted" &&
+    ["active", "trialing"].includes(latestSubscription.status);
 
-  if (event.type === "checkout.session.completed") {
-    const session = event.data.object as import("stripe").default.Checkout.Session;
-
-    if (session.mode !== "subscription" || !session.subscription) {
-      return;
-    }
-
-    const vendorId = session.metadata?.vendorId;
-
-    if (
-      !vendorId ||
-      session.client_reference_id !== vendorId ||
-      session.metadata?.plan !== "premium"
-    ) {
-      throw new Error("Invalid vendor metadata in Stripe Checkout Session.");
-    }
-
-    const vendorObjectId = new UUID(vendorId);
-
-    const existingTransaction = await getTransactionsCollection().findOne({
-      stripeSessionId: session.id,
-      vendorId: vendorObjectId,
-      plan: "premium",
-      status: { $in: ["pending", "paid"] },
-    });
-
-    if (!existingTransaction) {
-      throw new Error("Verified subscription transaction was not found.");
-    }
-
-    if (
-      session.payment_status !== "paid" &&
-      session.payment_status !== "no_payment_required"
-    ) {
-      return;
-    }
-
-    const subscriptionId =
-      typeof session.subscription === "string"
-        ? session.subscription
-        : session.subscription.id;
-
-    const subscription = await stripe.subscriptions.retrieve(subscriptionId);
-
-    if (!["active", "trialing"].includes(subscription.status)) {
-      return;
-    }
-
-    const currentPeriodEnd = subscription.items.data[0]?.current_period_end;
+  if (isActive) {
+    const currentPeriodEnd =
+      latestSubscription.items.data[0]?.current_period_end;
 
     if (!currentPeriodEnd) {
       throw new Error("Stripe subscription period end is unavailable.");
     }
 
-    const transactionResult = await getTransactionsCollection().updateOne(
-      {
-        stripeSessionId: session.id,
-        vendorId: vendorObjectId,
-        status: { $in: ["pending", "paid"] },
-      },
-      {
-        $set: {
-          status: "paid",
-          stripeSubscriptionId: subscriptionId,
-        },
-      }
-    );
-
-    if (transactionResult.matchedCount !== 1) {
-      throw new Error("Subscription transaction could not be verified.");
-    }
-
-    const vendorResult = await getUsersCollection().updateOne(
+    await getUsersCollection().updateOne(
       {
         _id: vendorObjectId,
         role: "vendor",
         isBlocked: false,
+        stripeSubscriptionId: subscriptionId,
       },
       {
         $set: {
@@ -267,10 +553,52 @@ export const handleSubscriptionWebhook = async (
       }
     );
 
-    if (vendorResult.matchedCount !== 1) {
-      throw new Error("Eligible vendor account was not found.");
-    }
+    return;
+  }
 
+  if (event.type === "customer.subscription.deleted") {
+    await getUsersCollection().updateOne(
+      {
+        _id: vendorObjectId,
+        role: "vendor",
+        stripeSubscriptionId: subscriptionId,
+      },
+      {
+        $set: {
+          subscriptionPlan: "free",
+          subscriptionExpiresAt: null,
+        },
+        $unset: {
+          stripeSubscriptionId: "",
+        },
+      }
+    );
+
+    return;
+  }
+
+  // For non-active states such as past_due, downgrade the vendor.
+  // Keep the subscription ID so a later recovery to active can reactivate it.
+  await getUsersCollection().updateOne(
+    {
+      _id: vendorObjectId,
+      role: "vendor",
+      stripeSubscriptionId: subscriptionId,
+    },
+    {
+      $set: {
+        subscriptionPlan: "free",
+        subscriptionExpiresAt: null,
+      },
+    }
+  );
+};
+
+export const handleSubscriptionWebhook = async (
+  event: StripeEvent
+): Promise<void> => {
+  if (event.type === "checkout.session.completed") {
+    await handleCheckoutCompleted(event);
     return;
   }
 
@@ -278,53 +606,6 @@ export const handleSubscriptionWebhook = async (
     event.type === "customer.subscription.updated" ||
     event.type === "customer.subscription.deleted"
   ) {
-    const subscription = event.data.object as import("stripe").default.Subscription;
-    const vendorId = subscription.metadata?.vendorId;
-
-    if (!vendorId) {
-      throw new Error("Vendor ID is missing from subscription metadata.");
-    }
-
-    const vendorObjectId = new UUID(vendorId);
-
-    const isActive =
-      event.type === "customer.subscription.updated" &&
-      ["active", "trialing"].includes(subscription.status);
-
-    if (isActive) {
-      const currentPeriodEnd = subscription.items.data[0]?.current_period_end;
-
-      if (!currentPeriodEnd) {
-        throw new Error("Stripe subscription period end is unavailable.");
-      }
-
-      await getUsersCollection().updateOne(
-        {
-          _id: vendorObjectId,
-          role: "vendor",
-          isBlocked: false,
-        },
-        {
-          $set: {
-            subscriptionPlan: "premium",
-            subscriptionExpiresAt: new Date(currentPeriodEnd * 1000),
-          },
-        }
-      );
-    } else {
-      await getUsersCollection().updateOne(
-        {
-          _id: vendorObjectId,
-          role: "vendor",
-        },
-        {
-          $set: {
-            subscriptionPlan: "free",
-            subscriptionExpiresAt: null,
-          },
-        }
-      );
-    }
+    await handleSubscriptionLifecycle(event);
   }
 };
-
