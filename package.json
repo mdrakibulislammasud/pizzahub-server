@@ -4,10 +4,12 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "dev": "tsx watch src/server.ts",
+    "dev": "tsx watch --require ./dns-fix.cjs src/server.ts",
     "build": "tsc",
     "start": "node dist/src/server.js",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "stripe:listen": "stripe listen --events checkout.session.completed,customer.subscription.updated,customer.subscription.deleted,invoice.paid,invoice.payment_failed --forward-to http://localhost:5000/api/subscriptions/webhook",
+    "dev:stripe": "node --require ./dns-fix.cjs scripts/dev-stripe.cjs"
   },
   "keywords": [],
   "author": "",
@@ -30,6 +32,7 @@
     "@types/express": "^5.0.6",
     "@types/multer": "^2.3.0",
     "@types/node": "^26.6.6",
+    "concurrently": "^10.0.7",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2"
   }
