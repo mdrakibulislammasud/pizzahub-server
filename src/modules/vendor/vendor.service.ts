@@ -76,6 +76,7 @@ export const getVendorDashboardOverview = async (
       menuCollection().countDocuments({
         vendorId,
         status: "approved",
+        isActive: { $ne: false },
       }),
 
       orderCollection().countDocuments({
