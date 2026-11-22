@@ -1,4 +1,4 @@
-﻿
+
 import { betterAuth } from "better-auth";
 import { createAuthMiddleware, APIError } from "better-auth/api";
 import { mongodbAdapter } from "@better-auth/mongo-adapter";
@@ -148,6 +148,10 @@ export const auth = betterAuth({
   ],
 
   advanced: {
+    defaultCookieAttributes: {
+      sameSite: "none",
+      secure: true,
+    },
     database: {
       generateId: "uuid",
     },
