@@ -1,4 +1,5 @@
-﻿import { ObjectId, UUID } from "mongodb";
+﻿
+import { ObjectId, UUID } from "mongodb";
 
 import { client } from "../../config/db.js";
 import { env } from "../../config/env.js";
@@ -15,9 +16,9 @@ import type {
 
 import type { CreateOrderInput } from "./order.validation.js";
 
-// --------------------------------------------------
+// ==========================================
 // DATABASE DOCUMENT TYPES
-// --------------------------------------------------
+// ==========================================
 
 interface OrderDocument extends Omit<Order, "_id"> {
   _id?: ObjectId;
@@ -29,6 +30,7 @@ interface MenuItemDocument {
   vendorId: string;
   itemName: string;
   status: string;
+  isActive?: boolean;
   category: string;
   price: number;
   location: string;
@@ -57,12 +59,12 @@ interface OrderMenuItemLookup {
 }
 
 interface OrderLookupDocument extends OrderDocument {
-  menuItem?: OrderMenuItemLookup;
+  menuItem?: OrderMenuItemLookup | null;
 }
 
-// --------------------------------------------------
+// ==========================================
 // CUSTOM ERROR
-// --------------------------------------------------
+// ==========================================
 
 export class OrderServiceError extends Error {
   constructor(
@@ -74,22 +76,25 @@ export class OrderServiceError extends Error {
   }
 }
 
-// --------------------------------------------------
-// COLLECTION HELPERS
-// --------------------------------------------------
+// ==========================================
+// DATABASE COLLECTIONS
+// ==========================================
 
 const orderCollection = () =>
-  client.db(env.DB_NAME).collection<OrderDocument>("orders");
+  client.db(env.DB_NAME)
+    .collection<OrderDocument>("orders");
 
 const menuCollection = () =>
-  client.db(env.DB_NAME).collection<MenuItemDocument>("menuItems");
+  client.db(env.DB_NAME)
+    .collection<MenuItemDocument>("menuItems");
 
 const usersCollection = () =>
-  client.db(env.DB_NAME).collection<UserDocument>("user");
+  client.db(env.DB_NAME)
+    .collection<UserDocument>("user");
 
-// --------------------------------------------------
+// ==========================================
 // ORDER INDEXES
-// --------------------------------------------------
+// ==========================================
 
 export const ensureOrderIndexes = async (): Promise<void> => {
   await orderCollection().createIndex(
@@ -102,18 +107,31 @@ export const ensureOrderIndexes = async (): Promise<void> => {
   );
 };
 
-// --------------------------------------------------
+// ==========================================
 // HELPER FUNCTIONS
-// --------------------------------------------------
+// ==========================================
 
 const formatOrder = (order: OrderDocument): Order => {
-  const { _id, activeOrderKey, ...orderData } = order;
-
-  void activeOrderKey;
+  const quantity = order.quantity ?? 1;
 
   return {
-    ...orderData,
-    _id: _id?.toString(),
+    _id: order._id?.toString(),
+    itemId: order.itemId,
+    vendorId: order.vendorId,
+    customerId: order.customerId,
+
+    quantity,
+
+    totalPrice:
+      order.totalPrice ??
+      (order.itemSnapshot?.price ?? 0) * quantity,
+
+    deliveryDate: order.deliveryDate,
+    deliveryAddress: order.deliveryAddress,
+    message: order.message,
+    status: order.status,
+    createdAt: order.createdAt,
+    itemSnapshot: order.itemSnapshot,
   };
 };
 
@@ -134,9 +152,11 @@ const getValidUUID = (value: string): UUID | null => {
 };
 
 const formatMenuItemInfo = (
-  item: OrderMenuItemLookup | undefined,
+  item?: OrderMenuItemLookup | null,
 ): OrderMenuItemInfo | null => {
-  if (!item) return null;
+  if (!item) {
+    return null;
+  }
 
   return {
     _id: item._id.toString(),
@@ -148,16 +168,48 @@ const formatMenuItemInfo = (
   };
 };
 
+const resolveMenuItem = (
+  order: OrderLookupDocument,
+): OrderMenuItemInfo | null => {
+  return order.itemSnapshot ??
+    formatMenuItemInfo(order.menuItem);
+};
+
+const resolveMenuItemSource = (
+  order: OrderLookupDocument,
+): "snapshot" | "current-menu" | "unavailable" => {
+  if (order.itemSnapshot) {
+    return "snapshot";
+  }
+
+  if (order.menuItem) {
+    return "current-menu";
+  }
+
+  return "unavailable";
+};
+
+// ==========================================
+// MENU LOOKUP PIPELINE
+// ==========================================
+
 const getOrderMenuLookupPipeline = () => [
   {
     $lookup: {
       from: "menuItems",
-      let: { itemId: "$itemId" },
+
+      let: {
+        itemId: "$itemId",
+      },
+
       pipeline: [
         {
           $match: {
             $expr: {
-              $eq: [{ $toString: "$_id" }, "$$itemId"],
+              $eq: [
+                { $toString: "$_id" },
+                "$$itemId",
+              ],
             },
           },
         },
@@ -171,6 +223,7 @@ const getOrderMenuLookupPipeline = () => [
           },
         },
       ],
+
       as: "menuItem",
     },
   },
@@ -182,22 +235,32 @@ const getOrderMenuLookupPipeline = () => [
   },
 ];
 
-// --------------------------------------------------
-// CUSTOMER: CREATE ORDER
-// --------------------------------------------------
+// ==========================================
+// CREATE CUSTOMER ORDER
+// ==========================================
 
 export const createOrder = async (
   customerId: string,
   data: CreateOrderInput,
 ): Promise<Order> => {
   if (!ObjectId.isValid(data.itemId)) {
-    throw new OrderServiceError("Invalid menu item ID.", 400);
+    throw new OrderServiceError(
+      "Invalid menu item ID.",
+      400,
+    );
   }
+
+  const itemId = new ObjectId(
+    data.itemId,
+  ).toHexString();
 
   const customerUUID = getValidUUID(customerId);
 
   if (!customerUUID) {
-    throw new OrderServiceError("Invalid customer account.", 400);
+    throw new OrderServiceError(
+      "Invalid customer account.",
+      400,
+    );
   }
 
   const customer = await usersCollection().findOne({
@@ -205,7 +268,10 @@ export const createOrder = async (
   });
 
   if (!customer || customer.role !== "customer") {
-    throw new OrderServiceError("Customer account not found.", 404);
+    throw new OrderServiceError(
+      "Customer account not found.",
+      404,
+    );
   }
 
   if (customer.isBlocked) {
@@ -216,8 +282,9 @@ export const createOrder = async (
   }
 
   const menuItem = await menuCollection().findOne({
-    _id: new ObjectId(data.itemId),
+    _id: new ObjectId(itemId),
     status: "approved",
+    isActive: { $ne: false },
   });
 
   if (!menuItem) {
@@ -234,6 +301,16 @@ export const createOrder = async (
     );
   }
 
+  if (
+    !Number.isFinite(menuItem.price) ||
+    menuItem.price <= 0
+  ) {
+    throw new OrderServiceError(
+      "This menu item has an invalid price.",
+      400,
+    );
+  }
+
   const vendorUUID = getValidUUID(menuItem.vendorId);
 
   if (!vendorUUID) {
@@ -247,14 +324,47 @@ export const createOrder = async (
     _id: vendorUUID,
   });
 
-  if (!vendor || vendor.role !== "vendor" || vendor.isBlocked) {
+  if (
+    !vendor ||
+    vendor.role !== "vendor" ||
+    vendor.isBlocked
+  ) {
     throw new OrderServiceError(
       "This restaurant is currently unavailable.",
       404,
     );
   }
 
-  // Delivery must be a future date in Bangladesh.
+  // QUANTITY AND TOTAL PRICE
+
+  const quantity = data.quantity ?? 1;
+
+  if (
+    !Number.isInteger(quantity) ||
+    quantity < 1 ||
+    quantity > 99
+  ) {
+    throw new OrderServiceError(
+      "Quantity must be between 1 and 99.",
+      400,
+    );
+  }
+
+  // Calculate total on the server.
+  const totalPrice = menuItem.price * quantity;
+
+  if (
+    !Number.isFinite(totalPrice) ||
+    totalPrice <= 0
+  ) {
+    throw new OrderServiceError(
+      "Invalid order total.",
+      400,
+    );
+  }
+
+  // DELIVERY DATE VALIDATION
+
   const today = getBangladeshToday();
 
   if (data.deliveryDate <= today) {
@@ -270,28 +380,36 @@ export const createOrder = async (
 
   if (
     Number.isNaN(deliveryDate.getTime()) ||
-    deliveryDate.toISOString().slice(0, 10) !== data.deliveryDate
+    deliveryDate.toISOString().slice(0, 10) !==
+      data.deliveryDate
   ) {
-    throw new OrderServiceError("Invalid delivery date.", 400);
+    throw new OrderServiceError(
+      "Invalid delivery date.",
+      400,
+    );
   }
 
-  // One active order per customer, item and delivery date.
+  // DUPLICATE ORDER PREVENTION
+
   const activeOrderKey = [
     customerId,
-    data.itemId,
+    itemId,
     data.deliveryDate,
   ].join(":");
 
   const dateEnd = new Date(deliveryDate);
+
   dateEnd.setUTCDate(dateEnd.getUTCDate() + 1);
 
   const existingOrder = await orderCollection().findOne({
     customerId,
-    itemId: data.itemId,
+    itemId,
+
     deliveryDate: {
       $gte: deliveryDate,
       $lt: dateEnd,
     },
+
     status: {
       $in: ["pending", "accepted"],
     },
@@ -304,30 +422,54 @@ export const createOrder = async (
     );
   }
 
+  // STORE ORIGINAL FOOD INFORMATION
+
+  const itemSnapshot: OrderMenuItemInfo = {
+    _id: itemId,
+    itemName: menuItem.itemName,
+    category: menuItem.category,
+    price: menuItem.price,
+    location: menuItem.location,
+    images: [...(menuItem.images ?? [])],
+  };
+
+  // CREATE NEW ORDER
+
   const newOrder: OrderDocument = {
-    itemId: data.itemId,
+    itemId,
     vendorId: menuItem.vendorId,
     customerId,
+
+    quantity,
+    totalPrice,
+
     deliveryDate,
     deliveryAddress: data.deliveryAddress,
     message: data.message,
     status: "pending",
     activeOrderKey,
+    itemSnapshot,
     createdAt: new Date(),
   };
 
   try {
-    const result = await orderCollection().insertOne(newOrder);
+    const result =
+      await orderCollection().insertOne(newOrder);
 
-    const savedOrder = await orderCollection().findOne({
-      _id: result.insertedId,
-    });
+    const savedOrder =
+      await orderCollection().findOne({
+        _id: result.insertedId,
+      });
 
     if (!savedOrder) {
-      throw new OrderServiceError("Failed to create order.", 409);
+      throw new OrderServiceError(
+        "Failed to create order.",
+        409,
+      );
     }
 
     return formatOrder(savedOrder);
+
   } catch (error) {
     if (
       typeof error === "object" &&
@@ -345,17 +487,21 @@ export const createOrder = async (
   }
 };
 
-// --------------------------------------------------
-// CUSTOMER: GET OWN ORDERS WITH MENU AND VENDOR INFO
-// --------------------------------------------------
+// ==========================================
+// GET CUSTOMER ORDERS
+// ==========================================
 
 export const getCustomerOrders = async (
   customerId: string,
 ): Promise<CustomerOrder[]> => {
   const orders = await orderCollection()
     .aggregate<OrderLookupDocument>([
-      { $match: { customerId } },
-      { $sort: { createdAt: -1 } },
+      {
+        $match: { customerId },
+      },
+      {
+        $sort: { createdAt: -1 },
+      },
       ...getOrderMenuLookupPipeline(),
     ])
     .toArray();
@@ -366,14 +512,21 @@ export const getCustomerOrders = async (
 
   const uniqueVendorUUIDs = [
     ...new Map(
-      vendorUUIDs.map((id) => [id.toString(), id]),
+      vendorUUIDs.map((id) => [
+        id.toString(),
+        id,
+      ]),
     ).values(),
   ];
 
   const vendors =
     uniqueVendorUUIDs.length > 0
       ? await usersCollection()
-          .find({ _id: { $in: uniqueVendorUUIDs } })
+          .find({
+            _id: {
+              $in: uniqueVendorUUIDs,
+            },
+          })
           .toArray()
       : [];
 
@@ -390,28 +543,29 @@ export const getCustomerOrders = async (
     ]),
   );
 
-  return orders.map((order) => {
-    const baseOrder = formatOrder(order);
-
-    return {
-      ...baseOrder,
-      menuItem: formatMenuItemInfo(order.menuItem),
-      vendor: vendorMap.get(order.vendorId) ?? null,
-    };
-  });
+  return orders.map<CustomerOrder>((order) => ({
+    ...formatOrder(order),
+    menuItem: resolveMenuItem(order),
+    menuItemSource: resolveMenuItemSource(order),
+    vendor: vendorMap.get(order.vendorId) ?? null,
+  }));
 };
 
-// --------------------------------------------------
-// VENDOR: GET OWN ORDERS WITH MENU AND CUSTOMER INFO
-// --------------------------------------------------
+// ==========================================
+// GET VENDOR ORDERS
+// ==========================================
 
 export const getVendorOrders = async (
   vendorId: string,
 ): Promise<VendorOrder[]> => {
   const orders = await orderCollection()
     .aggregate<OrderLookupDocument>([
-      { $match: { vendorId } },
-      { $sort: { createdAt: -1 } },
+      {
+        $match: { vendorId },
+      },
+      {
+        $sort: { createdAt: -1 },
+      },
       ...getOrderMenuLookupPipeline(),
     ])
     .toArray();
@@ -422,48 +576,70 @@ export const getVendorOrders = async (
 
   const uniqueCustomerUUIDs = [
     ...new Map(
-      customerUUIDs.map((id) => [id.toString(), id]),
+      customerUUIDs.map((id) => [
+        id.toString(),
+        id,
+      ]),
     ).values(),
   ];
 
   const customers =
     uniqueCustomerUUIDs.length > 0
       ? await usersCollection()
-          .find({ _id: { $in: uniqueCustomerUUIDs } })
+          .find({
+            _id: {
+              $in: uniqueCustomerUUIDs,
+            },
+          })
           .toArray()
       : [];
 
-  const customerMap = new Map<string, OrderCustomerInfo>(
-    customers.map((customer) => [
-      customer._id.toString(),
-      {
-        _id: customer._id.toString(),
-        name: customer.name ?? "Customer",
-        email: customer.email ?? "",
-        image: customer.image,
-      },
-    ]),
-  );
+  const customerMap =
+    new Map<string, OrderCustomerInfo>(
+      customers.map((customer) => [
+        customer._id.toString(),
+        {
+          _id: customer._id.toString(),
+          name: customer.name ?? "Customer",
+          email: customer.email ?? "",
+          image: customer.image,
+        },
+      ]),
+    );
 
-  return orders.map((order) => {
-    const baseOrder = formatOrder(order);
-
-    return {
-      ...baseOrder,
-      menuItem: formatMenuItemInfo(order.menuItem),
-      customer: customerMap.get(order.customerId) ?? null,
-    };
-  });
+  return orders.map<VendorOrder>((order) => ({
+    ...formatOrder(order),
+    menuItem: resolveMenuItem(order),
+    menuItemSource: resolveMenuItemSource(order),
+    customer: customerMap.get(order.customerId) ?? null,
+  }));
 };
 
-// --------------------------------------------------
-// VENDOR: ACCEPT OR REJECT ORDER
-// --------------------------------------------------
+// ==========================================
+// ADMIN: GET ALL ORDERS
+// IMPORTANT: DECLARED ONLY ONCE
+// ==========================================
+
+export const getAdminOrders = async (): Promise<Order[]> => {
+  const orders = await orderCollection()
+    .find({})
+    .sort({ createdAt: -1 })
+    .toArray();
+
+  return orders.map((order) => formatOrder(order));
+};
+
+// ==========================================
+// UPDATE VENDOR ORDER STATUS
+// ==========================================
 
 export const updateVendorOrderStatus = async (
   orderId: string,
   vendorId: string,
-  status: Extract<OrderStatus, "accepted" | "rejected">,
+  status: Extract<
+    OrderStatus,
+    "accepted" | "rejected"
+  >,
 ): Promise<Order | null> => {
   if (!ObjectId.isValid(orderId)) {
     return null;
@@ -478,18 +654,26 @@ export const updateVendorOrderStatus = async (
   const result = await orderCollection().updateOne(
     filter,
     {
-      $set: { status },
+      $set: {
+        status,
+      },
+
       ...(status === "rejected"
-        ? { $unset: { activeOrderKey: "" } }
+        ? {
+            $unset: {
+              activeOrderKey: "",
+            },
+          }
         : {}),
     },
   );
 
   if (result.matchedCount === 0) {
-    const existingOrder = await orderCollection().findOne({
-      _id: new ObjectId(orderId),
-      vendorId,
-    });
+    const existingOrder =
+      await orderCollection().findOne({
+        _id: new ObjectId(orderId),
+        vendorId,
+      });
 
     if (!existingOrder) {
       return null;
@@ -501,17 +685,20 @@ export const updateVendorOrderStatus = async (
     );
   }
 
-  const updatedOrder = await orderCollection().findOne({
-    _id: new ObjectId(orderId),
-    vendorId,
-  });
+  const updatedOrder =
+    await orderCollection().findOne({
+      _id: new ObjectId(orderId),
+      vendorId,
+    });
 
-  return updatedOrder ? formatOrder(updatedOrder) : null;
+  return updatedOrder
+    ? formatOrder(updatedOrder)
+    : null;
 };
 
-// --------------------------------------------------
-// CUSTOMER: CANCEL OWN PENDING ORDER
-// --------------------------------------------------
+// ==========================================
+// CANCEL CUSTOMER ORDER
+// ==========================================
 
 export const cancelCustomerOrder = async (
   orderId: string,
@@ -530,16 +717,22 @@ export const cancelCustomerOrder = async (
   const result = await orderCollection().updateOne(
     filter,
     {
-      $set: { status: "cancelled" },
-      $unset: { activeOrderKey: "" },
+      $set: {
+        status: "cancelled",
+      },
+
+      $unset: {
+        activeOrderKey: "",
+      },
     },
   );
 
   if (result.matchedCount === 0) {
-    const existingOrder = await orderCollection().findOne({
-      _id: new ObjectId(orderId),
-      customerId,
-    });
+    const existingOrder =
+      await orderCollection().findOne({
+        _id: new ObjectId(orderId),
+        customerId,
+      });
 
     if (!existingOrder) {
       return null;
@@ -551,18 +744,20 @@ export const cancelCustomerOrder = async (
     );
   }
 
-  const cancelledOrder = await orderCollection().findOne({
-    _id: new ObjectId(orderId),
-    customerId,
-  });
+  const cancelledOrder =
+    await orderCollection().findOne({
+      _id: new ObjectId(orderId),
+      customerId,
+    });
 
-  return cancelledOrder ? formatOrder(cancelledOrder) : null;
+  return cancelledOrder
+    ? formatOrder(cancelledOrder)
+    : null;
 };
 
-
-// --------------------------------------------------
+// ==========================================
 // CUSTOMER DASHBOARD OVERVIEW
-// --------------------------------------------------
+// ==========================================
 
 export interface CustomerDashboardOverview {
   totalOrders: number;
@@ -576,13 +771,29 @@ export const getCustomerDashboardOverview = async (
 ): Promise<CustomerDashboardOverview> => {
   const filter = { customerId };
 
-  const [totalOrders, pendingOrders, acceptedOrders, rejectedOrders] =
-    await Promise.all([
-      orderCollection().countDocuments(filter),
-      orderCollection().countDocuments({ ...filter, status: "pending" }),
-      orderCollection().countDocuments({ ...filter, status: "accepted" }),
-      orderCollection().countDocuments({ ...filter, status: "rejected" }),
-    ]);
+  const [
+    totalOrders,
+    pendingOrders,
+    acceptedOrders,
+    rejectedOrders,
+  ] = await Promise.all([
+    orderCollection().countDocuments(filter),
+
+    orderCollection().countDocuments({
+      ...filter,
+      status: "pending",
+    }),
+
+    orderCollection().countDocuments({
+      ...filter,
+      status: "accepted",
+    }),
+
+    orderCollection().countDocuments({
+      ...filter,
+      status: "rejected",
+    }),
+  ]);
 
   return {
     totalOrders,

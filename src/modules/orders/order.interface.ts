@@ -1,20 +1,9 @@
+
 export type OrderStatus =
   | "pending"
   | "accepted"
   | "rejected"
   | "cancelled";
-
-export interface Order {
-  _id?: string;
-  itemId: string;
-  vendorId: string;
-  customerId: string;
-  deliveryDate: Date;
-  deliveryAddress: string;
-  message?: string;
-  status: OrderStatus;
-  createdAt: Date;
-}
 
 export interface OrderMenuItemInfo {
   _id: string;
@@ -40,12 +29,35 @@ export interface OrderCustomerInfo {
   image?: string | null;
 }
 
+export interface Order {
+  _id?: string;
+
+  itemId: string;
+  vendorId: string;
+  customerId: string;
+
+  // NEW: Order quantity and calculated total
+  quantity: number;
+  totalPrice: number;
+
+  deliveryDate: Date;
+  deliveryAddress: string;
+  message?: string;
+
+  status: OrderStatus;
+  createdAt: Date;
+
+  itemSnapshot?: OrderMenuItemInfo;
+}
+
 export interface CustomerOrder extends Order {
   menuItem: OrderMenuItemInfo | null;
+  menuItemSource: "snapshot" | "current-menu" | "unavailable";
   vendor: OrderVendorInfo | null;
 }
 
 export interface VendorOrder extends Order {
   menuItem: OrderMenuItemInfo | null;
+  menuItemSource: "snapshot" | "current-menu" | "unavailable";
   customer: OrderCustomerInfo | null;
 }

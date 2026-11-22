@@ -1,3 +1,4 @@
+import { getVendorAnalyticsController } from "./vendor-analytics.controller.js";
 import { Router } from "express";
 
 import { verifyToken } from "../../middleware/verifyToken.js";
@@ -70,9 +71,11 @@ router.patch(
   updateVendorOrderStatusController,
 );
 
+router.get(
+  "/vendor/analytics",
+  verifyToken,
+  authorizeRoles("vendor"),
+  getVendorAnalyticsController,
+);
+
 export default router;
-
-
-
-
-

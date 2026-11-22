@@ -1,8 +1,12 @@
+
 import { z } from "zod";
 
 const objectIdSchema = z
   .string()
-  .regex(/^[0-9a-fA-F]{24}$/, "Please provide a valid menu item ID.");
+  .regex(
+    /^[0-9a-fA-F]{24}$/,
+    "Please provide a valid menu item ID.",
+  );
 
 const deliveryDateSchema = z
   .string()
@@ -20,6 +24,7 @@ const deliveryDateSchema = z
   }, "Please provide a valid delivery date.")
   .refine((value) => {
     const today = new Date();
+
     const todayInBangladesh = new Intl.DateTimeFormat("en-CA", {
       timeZone: "Asia/Dhaka",
       year: "numeric",
@@ -32,6 +37,14 @@ const deliveryDateSchema = z
 
 export const createOrderSchema = z.object({
   itemId: objectIdSchema,
+
+  // Quantity: minimum 1, maximum 99
+  quantity: z
+    .number()
+    .int("Quantity must be a whole number.")
+    .min(1, "Minimum quantity is 1.")
+    .max(99, "Maximum quantity is 99.")
+    .default(1),
 
   deliveryDate: deliveryDateSchema,
 
@@ -53,6 +66,7 @@ export const updateOrderStatusSchema = z.object({
 });
 
 export type CreateOrderInput = z.infer<typeof createOrderSchema>;
+
 export type UpdateOrderStatusInput = z.infer<
   typeof updateOrderStatusSchema
 >;

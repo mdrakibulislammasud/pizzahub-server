@@ -10,6 +10,7 @@ import {
   createOrder,
   getCustomerOrders,
   getVendorOrders,
+  getAdminOrders,
   updateVendorOrderStatus,
   cancelCustomerOrder,
 } from "./order.service.js";
@@ -187,10 +188,7 @@ export const cancelCustomerOrderController = async (
   }
 
   try {
-    const order = await cancelCustomerOrder(
-      String(req.params.id),
-      req.user.id,
-    );
+    const order = await cancelCustomerOrder(String(req.params.id), req.user.id);
 
     if (!order) {
       res.status(404).json({
@@ -210,3 +208,23 @@ export const cancelCustomerOrderController = async (
   }
 };
 
+
+
+
+// ADMIN: GET ALL ORDERS
+export const getAdminOrdersController = async (
+  _req: Request,
+  res: Response,
+): Promise<void> => {
+  try {
+    const orders = await getAdminOrders();
+
+    res.status(200).json({
+      success: true,
+      message: "All orders retrieved successfully.",
+      data: orders,
+    });
+  } catch (error) {
+    handleOrderError(res, error, "Failed to retrieve all orders.");
+  }
+};
