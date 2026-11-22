@@ -4,6 +4,7 @@ import { UUID, MongoServerError } from "mongodb";
 import { client } from "../../config/db.js";
 import { env } from "../../config/env.js";
 import { getStripeClient } from "../../config/stripe.js";
+import type Stripe from "stripe";
 
 interface VendorDocument {
   _id: UUID;
@@ -35,13 +36,11 @@ interface CheckoutLockDocument {
   createdAt: Date;
 }
 
-type StripeEvent = import("stripe").default.Event;
+type StripeEvent = Stripe.Event;
 
-type StripeSubscription =
-  import("stripe").default.Subscription;
+type StripeSubscription = Stripe.Subscription;
 
-type StripeCheckoutSession =
-  import("stripe").default.Checkout.Session;
+type StripeCheckoutSession = Stripe.Checkout.Session;
 
 // ==========================================
 // CUSTOM ERROR
@@ -872,8 +871,7 @@ const handleSubscriptionUpdated = async (
 
 // PIZZAHUB_INVOICE_LIFECYCLE_V1
 
-type StripeInvoice =
-  import("stripe").default.Invoice;
+type StripeInvoice = Stripe.Invoice;
 
 const getInvoiceSubscriptionId = (
   invoice: StripeInvoice
