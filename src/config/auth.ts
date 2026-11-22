@@ -1,4 +1,4 @@
-
+﻿
 import { betterAuth } from "better-auth";
 import { createAuthMiddleware, APIError } from "better-auth/api";
 import { mongodbAdapter } from "@better-auth/mongo-adapter";
@@ -16,6 +16,7 @@ export const auth = betterAuth({
 
   secret: env.BETTER_AUTH_SECRET,
   baseURL: env.BETTER_AUTH_URL,
+  trustedOrigins: [env.CLIENT_URL],
 
   emailAndPassword: {
     enabled: true,
@@ -152,3 +153,4 @@ export const auth = betterAuth({
     },
   },
 });
+
