@@ -3,13 +3,19 @@ import { ObjectId, UUID } from "mongodb";
 import { client } from "../../config/db.js";
 import { env } from "../../config/env.js";
 
-import type { MenuItem, MenuCategory } from "./menu.interface.js";
+import type {
+  MenuItem,
+  MenuCategory,
+} from "./menu.interface.js";
+
 import type {
   CreateMenuItemInput,
   UpdateMenuItemInput,
 } from "./menu.validation.js";
 
 interface UserDocument {
+  businessName?: string;
+  name?: string;
   _id: UUID;
   role?: string;
   isBlocked?: boolean;
@@ -19,6 +25,7 @@ interface UserDocument {
 
 interface MenuItemDocument extends Omit<MenuItem, "_id"> {
   _id?: ObjectId;
+  isActive?: boolean;
 }
 
 interface GetMenuItemsOptions {
@@ -30,24 +37,40 @@ interface GetMenuItemsOptions {
   limit?: number;
 }
 
+// Database collections
+
 const menuCollection = () =>
-  client.db(env.DB_NAME).collection<MenuItemDocument>("menuItems");
+  client
+    .db(env.DB_NAME)
+    .collection<MenuItemDocument>("menuItems");
 
 const usersCollection = () =>
-  client.db(env.DB_NAME).collection<UserDocument>("user");
+  client
+    .db(env.DB_NAME)
+    .collection<UserDocument>("user");
+
+// Helper functions
 
 const escapeRegex = (value: string): string =>
   value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-const formatMenuItem = (item: MenuItemDocument): MenuItem => ({
+const formatMenuItem = (
+  item: MenuItemDocument,
+): MenuItem => ({
   ...item,
   _id: item._id?.toString(),
 });
 
-const hasActivePremium = (vendor: UserDocument): boolean =>
+const hasActivePremium = (
+  vendor: UserDocument,
+): boolean =>
   vendor.subscriptionPlan === "premium" &&
   vendor.subscriptionExpiresAt instanceof Date &&
   vendor.subscriptionExpiresAt.getTime() > Date.now();
+
+// ==========================================
+// CREATE MENU ITEM
+// ==========================================
 
 export const createMenuItem = async (
   vendorId: string,
@@ -62,16 +85,21 @@ export const createMenuItem = async (
   }
 
   if (vendor.isBlocked) {
-    throw new Error("Blocked vendors cannot create menu items.");
+    throw new Error(
+      "Blocked vendors cannot create menu items.",
+    );
   }
 
-  const subscriptionPlan = hasActivePremium(vendor) ? "premium" : "free";
+  const subscriptionPlan = hasActivePremium(vendor)
+    ? "premium"
+    : "free";
 
   if (subscriptionPlan === "free") {
-    const activeItems = await menuCollection().countDocuments({
-      vendorId,
-      status: "approved",
-    });
+    const activeItems =
+      await menuCollection().countDocuments({
+        vendorId,
+        status: "approved",
+      });
 
     if (activeItems >= 3) {
       throw new Error(
@@ -86,11 +114,13 @@ export const createMenuItem = async (
     ...data,
     vendorId,
     status: "pending",
+    isActive: true,
     createdAt: now,
     updatedAt: now,
   };
 
-  const result = await menuCollection().insertOne(newMenuItem);
+  const result =
+    await menuCollection().insertOne(newMenuItem);
 
   const savedItem = await menuCollection().findOne({
     _id: result.insertedId,
@@ -102,6 +132,10 @@ export const createMenuItem = async (
 
   return formatMenuItem(savedItem);
 };
+
+// ==========================================
+// GET PUBLIC MENU ITEMS
+// ==========================================
 
 export const getPublicMenuItems = async (
   options: GetMenuItemsOptions = {},
@@ -115,12 +149,54 @@ export const getPublicMenuItems = async (
     limit = 12,
   } = options;
 
+  // Only allow active and existing vendors.
+
+  const eligibleVendors = await usersCollection()
+    .find(
+      {
+        role: "vendor",
+        isBlocked: { $ne: true },
+      },
+      {
+        projection: { _id: 1 , name: 1 , businessName: 1 , subscriptionPlan: 1 , subscriptionExpiresAt: 1 },
+      },
+    )
+    .toArray();
+
+  // PH_PUBLIC_MENU_SAFE_V3
+  const phVendorNames = new Map(
+    eligibleVendors.map(vendor => [
+      vendor._id.toString(),
+      {
+        name: vendor.name || "Restaurant",
+        businessName: vendor.businessName || ""
+      }
+    ])
+  );
+
+  const phPremiumVendorIds = eligibleVendors
+    .filter(hasActivePremium)
+    .map(vendor => vendor._id.toString());
+
+
+  const eligibleVendorIds = eligibleVendors.map(
+    (vendor) => vendor._id.toString(),
+  );
+
   const filter: Record<string, unknown> = {
     status: "approved",
+    isAvailable: { $ne: false },
+    isActive: { $ne: false },
+    vendorId: {
+      $in: eligibleVendorIds,
+    },
   };
 
   if (search?.trim()) {
-    const searchRegex = new RegExp(escapeRegex(search.trim()), "i");
+    const searchRegex = new RegExp(
+      escapeRegex(search.trim()),
+      "i",
+    );
 
     filter.$or = [
       { itemName: searchRegex },
@@ -140,7 +216,11 @@ export const getPublicMenuItems = async (
   }
 
   const safePage = Math.max(1, Math.floor(page));
-  const safeLimit = Math.min(50, Math.max(1, Math.floor(limit)));
+
+  const safeLimit = Math.min(
+    50,
+    Math.max(1, Math.floor(limit)),
+  );
 
   const sortOption: Record<string, 1 | -1> =
     sort === "price-asc"
@@ -151,17 +231,61 @@ export const getPublicMenuItems = async (
 
   const [items, total] = await Promise.all([
     menuCollection()
-      .find(filter)
-      .sort(sortOption)
-      .skip((safePage - 1) * safeLimit)
-      .limit(safeLimit)
+      .aggregate<MenuItemDocument>([
+        { $match: filter },
+
+        {
+          $addFields: {
+            __phPremiumRank: {
+              $cond: [
+                {
+                  $in: [
+                    "$vendorId",
+                    phPremiumVendorIds
+                  ]
+                },
+                1,
+                0
+              ]
+            }
+          }
+        },
+
+        {
+          $sort: sort
+            ? { ...sortOption, _id: 1 }
+            : {
+                __phPremiumRank: -1,
+                createdAt: -1,
+                _id: 1
+              }
+        },
+
+        { $skip: (safePage - 1) * safeLimit },
+        { $limit: safeLimit },
+
+        {
+          $project: {
+            __phPremiumRank: 0
+          }
+        }
+      ])
       .toArray(),
 
-    menuCollection().countDocuments(filter),
+    menuCollection().countDocuments(filter)
   ]);
 
   return {
-    items: items.map(formatMenuItem),
+    items: items.map(item =>
+      Object.assign(formatMenuItem(item), {
+        vendor:
+          phVendorNames.get(item.vendorId) ?? null,
+
+        isPremiumVendor:
+          phPremiumVendorIds.includes(item.vendorId)
+      })
+    ),
+
     pagination: {
       total,
       page: safePage,
@@ -170,6 +294,10 @@ export const getPublicMenuItems = async (
     },
   };
 };
+
+// ==========================================
+// GET SINGLE PUBLIC MENU ITEM
+// ==========================================
 
 export const getPublicMenuItemById = async (
   id: string,
@@ -181,10 +309,47 @@ export const getPublicMenuItemById = async (
   const item = await menuCollection().findOne({
     _id: new ObjectId(id),
     status: "approved",
+    isAvailable: { $ne: false },
+    isActive: { $ne: false },
   });
 
-  return item ? formatMenuItem(item) : null;
+  if (!item) {
+    return null;
+  }
+
+  let vendorId: UUID;
+
+  try {
+    vendorId = new UUID(item.vendorId);
+  } catch {
+    return null;
+  }
+
+  const vendor = await usersCollection().findOne({
+    _id: vendorId,
+    role: "vendor",
+    isBlocked: { $ne: true },
+  });
+
+  if (!vendor) {
+    return null;
+  }
+
+  return Object.assign(
+    formatMenuItem(item),
+    {
+      vendor: {
+        name: vendor.name || "Restaurant",
+        businessName: vendor.businessName || ""
+      },
+      isPremiumVendor: hasActivePremium(vendor)
+    }
+  );
 };
+
+// ==========================================
+// GET VENDOR MENU ITEMS
+// ==========================================
 
 export const getVendorMenuItems = async (
   vendorId: string,
@@ -197,6 +362,10 @@ export const getVendorMenuItems = async (
   return items.map(formatMenuItem);
 };
 
+// ==========================================
+// UPDATE VENDOR MENU ITEM
+// ==========================================
+
 export const updateVendorMenuItem = async (
   id: string,
   vendorId: string,
@@ -204,6 +373,71 @@ export const updateVendorMenuItem = async (
 ): Promise<MenuItem | null> => {
   if (!ObjectId.isValid(id)) {
     return null;
+  }
+
+  // Availability changes preserve admin approval.
+
+  if ("isActive" in data) {
+
+    const itemId = new ObjectId(id);
+
+    const ownItem = await menuCollection().findOne({
+      _id: itemId,
+      vendorId,
+      status: "approved",
+    });
+
+    if (!ownItem) {
+      return null;
+    }
+
+    const vendor = await usersCollection().findOne({
+      _id: new UUID(vendorId),
+      role: "vendor",
+      isBlocked: { $ne: true },
+    });
+
+    if (!vendor) {
+      return null;
+    }
+
+    if (data.isActive && !hasActivePremium(vendor)) {
+
+      const approvedItems =
+        await menuCollection().countDocuments({
+          vendorId,
+          status: "approved",
+        });
+
+      if (approvedItems > 3) {
+        throw new MenuApprovalLimitError(
+          "Your Free plan allows only 3 approved menu item slots. Upgrade to Premium or reduce your approved listings."
+        );
+      }
+    }
+
+    const updatedItem =
+      await menuCollection().findOneAndUpdate(
+        {
+          _id: itemId,
+          vendorId,
+          status: "approved",
+        },
+        {
+          $set: {
+            isActive: data.isActive,
+            updatedAt: new Date(),
+          },
+        },
+        {
+          returnDocument: "after",
+          includeResultMetadata: false,
+        }
+      );
+
+    return updatedItem
+      ? formatMenuItem(updatedItem)
+      : null;
   }
 
   const result = await menuCollection().updateOne(
@@ -214,6 +448,10 @@ export const updateVendorMenuItem = async (
     {
       $set: {
         ...data,
+
+        // Updated items require admin approval again.
+
+        status: "pending",
         updatedAt: new Date(),
       },
     },
@@ -223,12 +461,113 @@ export const updateVendorMenuItem = async (
     return null;
   }
 
+  const updatedItem =
+    await menuCollection().findOne({
+      _id: new ObjectId(id),
+      vendorId,
+    });
+
+  return updatedItem
+    ? formatMenuItem(updatedItem)
+    : null;
+};
+
+// ==========================================
+// DELETE VENDOR MENU ITEM
+// ==========================================
+
+
+/**
+ * Update vendor menu availability.
+ * This does not modify admin approval status.
+ */
+export const setVendorMenuAvailability = async (
+  id: string,
+  vendorId: string,
+  isActive: boolean,
+): Promise<MenuItem | null> => {
+
+  if (!ObjectId.isValid(id)) {
+    return null;
+  }
+
+  let vendorUUID: UUID;
+
+  try {
+    vendorUUID = new UUID(vendorId);
+  } catch {
+    return null;
+  }
+
+  const vendor = await usersCollection().findOne({
+    _id: vendorUUID,
+    role: "vendor",
+    isBlocked: { $ne: true },
+  });
+
+  if (!vendor) {
+    return null;
+  }
+
+  const itemId = new ObjectId(id);
+
+  const current = await menuCollection().findOne({
+    _id: itemId,
+    vendorId,
+    status: "approved",
+  });
+
+  if (!current) {
+    return null;
+  }
+
+  // Enforce the Free plan's visibility limit.
+
+  if (
+    isActive &&
+    current.isActive === false &&
+    !hasActivePremium(vendor)
+  ) {
+    const visibleCount =
+      await menuCollection().countDocuments({
+        vendorId,
+        status: "approved",
+        isActive: { $ne: false },
+      });
+
+    if (visibleCount >= 3) {
+      throw new MenuApprovalLimitError(
+        "Free plan allows at most 3 available pizzas. Disable another item or upgrade to Premium."
+      );
+    }
+  }
+
+  const result = await menuCollection().updateOne(
+    {
+      _id: itemId,
+      vendorId,
+      status: "approved",
+    },
+    {
+      $set: {
+        isActive,
+        updatedAt: new Date(),
+      },
+    }
+  );
+
+  if (result.matchedCount === 0) {
+    return null;
+  }
+
   const updatedItem = await menuCollection().findOne({
-    _id: new ObjectId(id),
+    _id: itemId,
     vendorId,
   });
 
-  return updatedItem ? formatMenuItem(updatedItem) : null;
+  return updatedItem
+    ? formatMenuItem(updatedItem)
+    : null;
 };
 
 export const deleteVendorMenuItem = async (
@@ -251,13 +590,18 @@ export const deleteVendorMenuItem = async (
 // ADMIN MENU MANAGEMENT
 // ==========================================
 
-
 export interface AdminMenuItemsOptions {
   search?: string;
   status?: MenuItem["status"];
   category?: MenuCategory;
   location?: string;
-  sort?: "newest" | "oldest" | "price-asc" | "price-desc";
+
+  sort?:
+    | "newest"
+    | "oldest"
+    | "price-asc"
+    | "price-desc";
+
   page?: number;
   limit?: number;
 }
@@ -269,6 +613,10 @@ export interface AdminMenuItemsResult {
   limit: number;
   totalPages: number;
 }
+
+// ==========================================
+// GET ALL MENU ITEMS FOR ADMIN
+// ==========================================
 
 export const getAllMenuItemsForAdmin = async (
   options: AdminMenuItemsOptions = {},
@@ -287,18 +635,33 @@ export const getAllMenuItemsForAdmin = async (
     status?: MenuItem["status"];
     category?: MenuCategory;
     location?: RegExp;
-    $or?: { itemName?: RegExp; description?: RegExp }[];
+
+    $or?: {
+      itemName?: RegExp;
+      description?: RegExp;
+    }[];
   } = {};
 
-  if (status) filter.status = status;
-  if (category) filter.category = category;
+  if (status) {
+    filter.status = status;
+  }
+
+  if (category) {
+    filter.category = category;
+  }
 
   if (location) {
-    filter.location = new RegExp(escapeRegex(location), "i");
+    filter.location = new RegExp(
+      escapeRegex(location),
+      "i",
+    );
   }
 
   if (search) {
-    const searchRegex = new RegExp(escapeRegex(search), "i");
+    const searchRegex = new RegExp(
+      escapeRegex(search),
+      "i",
+    );
 
     filter.$or = [
       { itemName: searchRegex },
@@ -317,6 +680,7 @@ export const getAllMenuItemsForAdmin = async (
 
   const [total, items] = await Promise.all([
     menuCollection().countDocuments(filter),
+
     menuCollection()
       .find(filter)
       .sort(sortOptions)
@@ -334,12 +698,20 @@ export const getAllMenuItemsForAdmin = async (
   };
 };
 
+// ==========================================
+// MENU APPROVAL LIMIT ERROR
+// ==========================================
+
 export class MenuApprovalLimitError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "MenuApprovalLimitError";
   }
 }
+
+// ==========================================
+// UPDATE MENU ITEM STATUS
+// ==========================================
 
 export const updateMenuItemStatus = async (
   id: string,
@@ -351,28 +723,39 @@ export const updateMenuItemStatus = async (
 
   const itemId = new ObjectId(id);
 
-  const existingItem = await menuCollection().findOne({
-    _id: itemId,
-  });
+  const existingItem =
+    await menuCollection().findOne({
+      _id: itemId,
+    });
 
   if (!existingItem) {
     return null;
   }
 
-  if (status === "approved" && existingItem.status !== "approved") {
+  if (status === "approved") {
     const vendor = await usersCollection().findOne({
       _id: new UUID(existingItem.vendorId),
     });
 
-    if (!vendor || vendor.role !== "vendor" || vendor.isBlocked) {
-      throw new Error("This menu item's vendor account is unavailable.");
+    if (
+      !vendor ||
+      vendor.role !== "vendor" ||
+      vendor.isBlocked
+    ) {
+      throw new Error(
+        "This menu item's vendor account is unavailable.",
+      );
     }
 
-    if (!hasActivePremium(vendor)) {
-      const activeItems = await menuCollection().countDocuments({
-        vendorId: existingItem.vendorId,
-        status: "approved",
-      });
+    if (
+      existingItem.status !== "approved" &&
+      !hasActivePremium(vendor)
+    ) {
+      const activeItems =
+        await menuCollection().countDocuments({
+          vendorId: existingItem.vendorId,
+          status: "approved",
+        });
 
       if (activeItems >= 3) {
         throw new MenuApprovalLimitError(
@@ -383,7 +766,9 @@ export const updateMenuItemStatus = async (
   }
 
   const result = await menuCollection().updateOne(
-    { _id: itemId },
+    {
+      _id: itemId,
+    },
     {
       $set: {
         status,
@@ -396,12 +781,20 @@ export const updateMenuItemStatus = async (
     return null;
   }
 
-  const updatedItem = await menuCollection().findOne({
-    _id: itemId,
-  });
+  const updatedItem =
+    await menuCollection().findOne({
+      _id: itemId,
+    });
 
-  return updatedItem ? formatMenuItem(updatedItem) : null;
+  return updatedItem
+    ? formatMenuItem(updatedItem)
+    : null;
 };
+
+// ==========================================
+// DELETE MENU ITEM BY ADMIN
+// ==========================================
+
 export const deleteMenuItemByAdmin = async (
   id: string,
 ): Promise<boolean> => {
@@ -415,6 +808,3 @@ export const deleteMenuItemByAdmin = async (
 
   return result.deletedCount > 0;
 };
-
-
-

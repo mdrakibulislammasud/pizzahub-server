@@ -1,4 +1,4 @@
-﻿import { Router } from "express";
+import { Router } from "express";
 
 import { verifyToken } from "../middleware/verifyToken.js";
 import { authorizeRoles } from "../middleware/authorizeRoles.js";
@@ -15,6 +15,7 @@ import {
   updateMenuItemStatusController,
   deleteMenuItemByAdminController,
 } from "../modules/menu/menu.controller.js";
+
 
 const router = Router();
 
@@ -82,5 +83,4 @@ router.delete(
   authorizeRoles("vendor"),
   deleteVendorMenuItemController,
 );
-
 export default router;

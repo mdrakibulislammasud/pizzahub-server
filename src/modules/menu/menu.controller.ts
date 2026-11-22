@@ -14,6 +14,7 @@ import {
   getPublicMenuItemById,
   getVendorMenuItems,
   updateVendorMenuItem,
+  setVendorMenuAvailability,
   deleteVendorMenuItem,
   getAllMenuItemsForAdmin,
   updateMenuItemStatus,
@@ -267,6 +268,43 @@ export const updateVendorMenuItemController = async (
       return;
     }
 
+
+    // VENDOR_AVAILABILITY_HANDLER
+    // Visibility updates do not reset approval.
+
+    if (
+      req.body !== null &&
+      typeof req.body === "object" &&
+      !Array.isArray(req.body) &&
+      Object.keys(req.body).length === 1 &&
+      typeof req.body.isActive === "boolean"
+    ) {
+      const updatedItem =
+        await setVendorMenuAvailability(
+          req.params.id as string,
+          req.user.id,
+          req.body.isActive,
+        );
+
+      if (!updatedItem) {
+        res.status(404).json({
+          success: false,
+          message:
+            "Approved menu item not found or access denied.",
+        });
+        return;
+      }
+
+      res.status(200).json({
+        success: true,
+        message:
+          "Menu availability updated successfully.",
+        data: updatedItem,
+      });
+
+      return;
+    }
+
     const validation = updateMenuItemSchema.safeParse(req.body);
 
     if (!validation.success) {
@@ -287,7 +325,7 @@ export const updateVendorMenuItemController = async (
     if (!updatedItem) {
       res.status(404).json({
         success: false,
-        message: "Menu item not found or you do not own this item.",
+        message: "Menu item not found, not owned by you, or not eligible for this update.",
       });
       return;
     }
@@ -298,6 +336,14 @@ export const updateVendorMenuItemController = async (
       data: updatedItem,
     });
   } catch (error) {
+    if (error instanceof MenuApprovalLimitError) {
+      res.status(409).json({
+        success: false,
+        message: error.message,
+      });
+      return;
+    }
+
     console.error("Update menu item error:", error);
 
     res.status(500).json({

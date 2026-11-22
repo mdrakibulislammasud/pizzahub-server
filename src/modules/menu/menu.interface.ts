@@ -22,6 +22,7 @@ export interface MenuItem {
   location: string;
   images: string[];
   status: MenuItemStatus;
+  isActive?: boolean;
   createdAt: Date;
   updatedAt: Date;
 }

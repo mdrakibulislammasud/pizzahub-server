@@ -40,12 +40,20 @@ export const createMenuItemSchema = z.object({
     .min(1, "At least one menu image is required."),
 });
 
-export const updateMenuItemSchema = createMenuItemSchema
-  .partial()
-  .refine(
-    (data) => Object.keys(data).length > 0,
-    "At least one field is required to update.",
-  );
+export const updateAvailabilitySchema = z.object({
+  isActive: z.boolean(),
+}).strict();
+
+export const updateMenuItemSchema = z.union([
+  updateAvailabilitySchema,
+  createMenuItemSchema
+    .partial()
+    .strict()
+    .refine(
+      (data) => Object.keys(data).length > 0,
+      "At least one field is required to update.",
+    ),
+]);
 
 export type CreateMenuItemInput = z.infer<typeof createMenuItemSchema>;
 export type UpdateMenuItemInput = z.infer<typeof updateMenuItemSchema>;
