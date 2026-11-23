@@ -23,22 +23,19 @@ const deliveryDateSchema = z
     );
   }, "Please provide a valid delivery date.")
   .refine((value) => {
-    const today = new Date();
-
     const todayInBangladesh = new Intl.DateTimeFormat("en-CA", {
       timeZone: "Asia/Dhaka",
       year: "numeric",
       month: "2-digit",
       day: "2-digit",
-    }).format(today);
+    }).format(new Date());
 
-    return value > todayInBangladesh;
-  }, "Delivery date must be a future date. Same-day delivery is not available.");
+    return value >= todayInBangladesh;
+  }, "Delivery date cannot be in the past.");
 
 export const createOrderSchema = z.object({
   itemId: objectIdSchema,
 
-  // Quantity: minimum 1, maximum 99
   quantity: z
     .number()
     .int("Quantity must be a whole number.")

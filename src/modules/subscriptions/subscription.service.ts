@@ -37,9 +37,7 @@ interface CheckoutLockDocument {
 }
 
 type StripeEvent = Stripe.Event;
-
 type StripeSubscription = Stripe.Subscription;
-
 type StripeCheckoutSession = Stripe.Checkout.Session;
 
 // ==========================================
@@ -868,8 +866,8 @@ const handleSubscriptionUpdated = async (
 };
 
 // ==========================================
-
-// PIZZAHUB_INVOICE_LIFECYCLE_V1
+// INVOICE LIFECYCLE
+// ==========================================
 
 type StripeInvoice = Stripe.Invoice;
 
@@ -1045,6 +1043,62 @@ const handleRenewalInvoice = async (
   );
 };
 
+// ==========================================
+// CHECKOUT SESSION FAILURE / EXPIRATION
+// ==========================================
+
+const handleCheckoutSessionTerminal = async (
+  session: StripeCheckoutSession,
+  status: "failed" | "cancelled"
+): Promise<void> => {
+  // Only vendor Premium subscription sessions belong here.
+  if (session.mode !== "subscription") return;
+
+  const vendorId = session.metadata?.vendorId;
+
+  if (
+    !vendorId ||
+    session.client_reference_id !== vendorId ||
+    session.metadata?.plan !== "premium"
+  ) {
+    throw new Error(
+      "Invalid vendor metadata in Stripe Checkout Session."
+    );
+  }
+
+  const vendorObjectId = getVendorObjectId(vendorId);
+  const transactions = getTransactionsCollection();
+
+  const transaction = await transactions.findOne({
+    stripeSessionId: session.id,
+    vendorId: vendorObjectId,
+    plan: "premium",
+  });
+
+  if (!transaction) {
+    // Return 5xx through the webhook controller so Stripe retries.
+    throw new Error(
+      "Checkout transaction was not found for terminal event."
+    );
+  }
+
+  // Never let a delayed failure/expiration event overwrite a paid transaction.
+  if (transaction.status !== "pending") return;
+
+  await transactions.updateOne(
+    {
+      stripeSessionId: session.id,
+      vendorId: vendorObjectId,
+      plan: "premium",
+      status: "pending",
+    },
+    {
+      $set: { status },
+    }
+  );
+};
+
+// ==========================================
 // STRIPE WEBHOOK ROUTING
 // ==========================================
 
@@ -1068,11 +1122,36 @@ export const handleSubscriptionWebhook = async (
       return;
     }
 
-    case "checkout.session.completed": {
+    case "checkout.session.completed":
+    case "checkout.session.async_payment_succeeded": {
       const session =
         event.data.object as StripeCheckoutSession;
 
       await handleCheckoutCompleted(session);
+
+      return;
+    }
+
+    case "checkout.session.async_payment_failed": {
+      const session =
+        event.data.object as StripeCheckoutSession;
+
+      await handleCheckoutSessionTerminal(
+        session,
+        "failed"
+      );
+
+      return;
+    }
+
+    case "checkout.session.expired": {
+      const session =
+        event.data.object as StripeCheckoutSession;
+
+      await handleCheckoutSessionTerminal(
+        session,
+        "cancelled"
+      );
 
       return;
     }

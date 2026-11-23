@@ -364,12 +364,13 @@ export const createOrder = async (
   }
 
   // DELIVERY DATE VALIDATION
+  // Allow today's date and future dates in Bangladesh.
 
   const today = getBangladeshToday();
 
-  if (data.deliveryDate <= today) {
+  if (data.deliveryDate < today) {
     throw new OrderServiceError(
-      "Delivery date must be a future date. Same-day delivery is not available.",
+      "Delivery date cannot be in the past.",
       400,
     );
   }

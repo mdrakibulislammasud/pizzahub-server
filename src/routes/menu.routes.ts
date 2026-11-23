@@ -3,6 +3,12 @@ import { Router } from "express";
 import { verifyToken } from "../middleware/verifyToken.js";
 import { authorizeRoles } from "../middleware/authorizeRoles.js";
 import { uploadMenuImage } from "../middleware/upload.middleware.js";
+import {
+  getMenuReviewsController,
+  createMenuReviewController,
+  getRestaurantReviewsController,
+  createRestaurantReviewController,
+} from "../modules/reviews/review.controller.js";
 
 import {
   createMenuItemController,
@@ -42,6 +48,26 @@ router.delete(
   verifyToken,
   authorizeRoles("admin"),
   deleteMenuItemByAdminController,
+);
+
+// ==========================================
+// REVIEWS
+// ==========================================
+
+// Keep the restaurant route before /:id so route intent stays explicit.
+router.get("/restaurant/:vendorId/reviews", getRestaurantReviewsController);
+router.post(
+  "/restaurant/:vendorId/reviews",
+  verifyToken,
+  authorizeRoles("customer"),
+  createRestaurantReviewController,
+);
+router.get("/:id/reviews", getMenuReviewsController);
+router.post(
+  "/:id/reviews",
+  verifyToken,
+  authorizeRoles("customer"),
+  createMenuReviewController,
 );
 
 // ==========================================
