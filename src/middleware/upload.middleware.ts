@@ -12,7 +12,7 @@ const upload = multer({
 
   limits: {
     fileSize: 5 * 1024 * 1024,
-    files: 1,
+    files: 5,
   },
 
   fileFilter: (_req: Request, file, callback) => {
@@ -27,18 +27,18 @@ const upload = multer({
   },
 });
 
-export const uploadMenuImage = (
+export const uploadMenuImages = (
   req: Request,
   res: Response,
   next: NextFunction,
 ): void => {
-  upload.single("image")(req, res, (error: unknown) => {
+  upload.array("images", 5)(req, res, (error: unknown) => {
     if (error instanceof multer.MulterError) {
       const message =
         error.code === "LIMIT_FILE_SIZE"
           ? "Image size cannot exceed 5 MB."
           : error.code === "LIMIT_FILE_COUNT"
-            ? "Only one image is allowed."
+            ? "You can upload up to 5 images."
             : "Image upload failed.";
 
       res.status(400).json({
@@ -55,6 +55,34 @@ export const uploadMenuImage = (
           error instanceof Error
             ? error.message
             : "Invalid image upload.",
+      });
+      return;
+    }
+
+    next();
+  });
+};
+
+// Profile settings still upload one image using the "image" field.
+export const uploadMenuImage = (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): void => {
+  upload.single("image")(req, res, (error: unknown) => {
+    if (error instanceof multer.MulterError) {
+      const message =
+        error.code === "LIMIT_FILE_SIZE"
+          ? "Image size cannot exceed 5 MB."
+          : "Image upload failed.";
+      res.status(400).json({ success: false, message });
+      return;
+    }
+
+    if (error) {
+      res.status(400).json({
+        success: false,
+        message: error instanceof Error ? error.message : "Invalid image upload.",
       });
       return;
     }

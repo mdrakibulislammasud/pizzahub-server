@@ -41,10 +41,14 @@ export const createMenuItemController = async (
       return;
     }
 
-    if (!req.file) {
+    const uploadedFiles = Array.isArray(req.files)
+      ? (req.files as Express.Multer.File[])
+      : [];
+
+    if (uploadedFiles.length === 0) {
       res.status(400).json({
         success: false,
-        message: "Menu item image is required.",
+        message: "At least one menu item image is required.",
       });
       return;
     }
@@ -63,11 +67,13 @@ export const createMenuItemController = async (
       return;
     }
 
-    const imageUrl = await uploadImageToImgBB(req.file.buffer);
+    const imageUrls = await Promise.all(
+      uploadedFiles.map((file) => uploadImageToImgBB(file.buffer)),
+    );
 
     const menuItem = await createMenuItem(req.user.id, {
       ...validation.data,
-      images: [imageUrl],
+      images: imageUrls,
     });
 
     res.status(201).json({

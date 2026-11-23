@@ -2,7 +2,7 @@ import { Router } from "express";
 
 import { verifyToken } from "../middleware/verifyToken.js";
 import { authorizeRoles } from "../middleware/authorizeRoles.js";
-import { uploadMenuImage } from "../middleware/upload.middleware.js";
+import { uploadMenuImages } from "../middleware/upload.middleware.js";
 import {
   getMenuReviewsController,
   createMenuReviewController,
@@ -85,7 +85,7 @@ router.post(
   "/",
   verifyToken,
   authorizeRoles("vendor"),
-  uploadMenuImage,
+  uploadMenuImages,
   createMenuItemController,
 );
 
